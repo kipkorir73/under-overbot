@@ -6,7 +6,7 @@ import StrategyControls from './components/StrategyControls';
 import LiveStats from './components/LiveStats';
 import Heatmap from './components/Heatmap';
 import { connectToDerivWS } from './services/derivService';
-import { calculateStats } from './services/statsService';
+import { calculateStats, updateStats } from './services/statsService';
 
 function App() {
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
@@ -14,6 +14,8 @@ function App() {
   const [digitHistory, setDigitHistory] = useState([]);
   const [currentDigit, setCurrentDigit] = useState(null);
   const [activeSignal, setActiveSignal] = useState(null);
+  const [waitingForResult, setWaitingForResult] = useState(false);
+  const [lastSignal, setLastSignal] = useState(null);
   const [stats, setStats] = useState({
     wins: 0,
     losses: 0,
@@ -30,6 +32,7 @@ function App() {
   const wsRef = useRef(null);
 
   useEffect(() => {
+    // Initialize WebSocket connection
     const ws = connectToDerivWS({
       onOpen: () => setConnectionStatus('connected'),
       onClose: () => setConnectionStatus('disconnected'),
@@ -37,14 +40,35 @@ function App() {
     });
     
     wsRef.current = ws;
-    return () => ws.close();
+    
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
   }, []);
 
   const handleTick = (tick) => {
     const digit = parseInt(tick.quote.toString().slice(-1));
     setCurrentDigit(digit);
-    setDigitHistory(prev => [...prev.slice(-9999), digit]);
+    
+    // Update digit history
+    const newHistory = [...digitHistory.slice(-9999), digit];
+    setDigitHistory(newHistory);
+    
+    // Check if we're waiting to evaluate a previous signal
+    if (waitingForResult && lastSignal) {
+      setStats(prev => updateStats(prev, lastSignal, digit, strategy));
+      setWaitingForResult(false);
+    }
+    
+    // Check for new signals
     checkForSignals(digit);
+    
+    // Update overall stats periodically
+    if (newHistory.length % 100 === 0 && newHistory.length > strategy.lookbackTicks) {
+      setStats(calculateStats(newHistory, strategy));
+    }
   };
 
   const checkForSignals = (digit) => {
@@ -53,14 +77,28 @@ function App() {
     const overCount = recentDigits.filter(d => d > strategy.overThreshold).length;
 
     if (underCount >= strategy.requiredStreak) {
-      const signal = { type: 'OVER', digit, confidence: underCount / strategy.lookbackTicks };
+      const signal = { 
+        type: 'OVER', 
+        digit, 
+        confidence: underCount / strategy.lookbackTicks,
+        threshold: strategy.underThreshold
+      };
       setActiveSignal(signal);
       speakAlert(signal);
+      setWaitingForResult(true);
+      setLastSignal(signal);
     } 
     else if (overCount >= strategy.requiredStreak) {
-      const signal = { type: 'UNDER', digit, confidence: overCount / strategy.lookbackTicks };
+      const signal = { 
+        type: 'UNDER', 
+        digit, 
+        confidence: overCount / strategy.lookbackTicks,
+        threshold: strategy.overThreshold
+      };
       setActiveSignal(signal);
       speakAlert(signal);
+      setWaitingForResult(true);
+      setLastSignal(signal);
     } 
     else {
       setActiveSignal(null);
@@ -76,14 +114,22 @@ function App() {
   };
 
   const handleSymbolChange = (symbol) => {
-    wsRef.current.changeSymbol(symbol);
+    if (wsRef.current) {
+      wsRef.current.changeSymbol(symbol);
+    }
     setActiveSymbol(symbol);
     setDigitHistory([]);
     setActiveSignal(null);
+    setWaitingForResult(false);
+    setLastSignal(null);
   };
 
   const updateStrategy = (newStrategy) => {
     setStrategy(newStrategy);
+    // Recalculate stats with new strategy
+    if (digitHistory.length > 0) {
+      setStats(calculateStats(digitHistory, newStrategy));
+    }
   };
 
   return (
@@ -100,6 +146,9 @@ function App() {
           }`}>
             {connectionStatus.toUpperCase()}
           </div>
+          <div className="text-sm">
+            Ticks: {digitHistory.length}
+          </div>
         </div>
       </header>
 
@@ -109,7 +158,10 @@ function App() {
             currentDigit={currentDigit}
             history={digitHistory.slice(-30)}
           />
-          <SignalIndicator signal={activeSignal} />
+          <SignalIndicator 
+            signal={activeSignal} 
+            waitingForResult={waitingForResult}
+          />
         </div>
 
         <div className="lg:col-span-1 space-y-6">
